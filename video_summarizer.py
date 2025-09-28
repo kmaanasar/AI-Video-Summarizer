@@ -33,7 +33,7 @@ class VideoSummarizer:
         try:
             # Load Whisper model (using base for balance of speed/accuracy)
             st.info("Loading Whisper model...")
-            self.whisper_model = whisper.load_model("base")
+            self.whisper_model = whisper.load_model("tiny")
             
             # Setup summarization model
             st.info("Loading summarization model...")
