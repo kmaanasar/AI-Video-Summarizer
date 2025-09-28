@@ -11,7 +11,7 @@ from pathlib import Path
 # Core libraries
 import whisper
 import moviepy.editor as mp
-from pytube import YouTube
+from pytubefix import YouTube
 import openai
 from transformers import pipeline, T5ForConditionalGeneration, T5Tokenizer
 import torch
