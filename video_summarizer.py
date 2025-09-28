@@ -11,7 +11,7 @@ from pathlib import Path
 # Core libraries
 import whisper
 import moviepy.editor as mp
-from pytubefix import YouTube
+import yt_dlp
 import openai
 from transformers import pipeline, T5ForConditionalGeneration, T5Tokenizer
 import torch
@@ -57,28 +57,54 @@ class VideoSummarizer:
             st.error(f"Error loading models: {str(e)}")
     
     def download_youtube_audio(self, url: str) -> str:
-        """Download audio from YouTube video"""
+        """Download audio from YouTube video using yt-dlp"""
         try:
             with st.spinner("Downloading YouTube video..."):
-                yt = YouTube(url)
-                
-                # Get video info
-                st.write(f"**Title:** {yt.title}")
-                st.write(f"**Duration:** {str(timedelta(seconds=yt.length))}")
-                st.write(f"**Author:** {yt.author}")
-                
-                # Download audio stream
-                audio_stream = yt.streams.filter(only_audio=True).first()
-                
-                # Create temp file
+                # Create temp directory
                 temp_dir = tempfile.mkdtemp()
-                audio_file = os.path.join(temp_dir, "audio.mp4")
+                audio_file = os.path.join(temp_dir, "audio")
                 
-                audio_stream.download(filename=audio_file)
-                return audio_file
+                # yt-dlp options
+                ydl_opts = {
+                    'format': 'bestaudio/best',
+                    'outtmpl': audio_file + '.%(ext)s',
+                    'postprocessors': [{
+                        'key': 'FFmpegExtractAudio',
+                        'preferredcodec': 'wav',
+                    }],
+                    'quiet': True,
+                    'no_warnings': True,
+                }
+                
+                # Download with yt-dlp
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    # Get video info first
+                    try:
+                        info = ydl.extract_info(url, download=False)
+                        st.write(f"**Title:** {info.get('title', 'Unknown')}")
+                        st.write(f"**Duration:** {str(timedelta(seconds=info.get('duration', 0)))}")
+                        st.write(f"**Uploader:** {info.get('uploader', 'Unknown')}")
+                    except:
+                        st.write("**Processing video...** (info extraction failed but continuing)")
+                    
+                    # Download the audio
+                    ydl.download([url])
+                
+                # Find the downloaded file
+                for file in os.listdir(temp_dir):
+                    if file.startswith("audio") and (file.endswith('.wav') or file.endswith('.mp3') or file.endswith('.m4a')):
+                        return os.path.join(temp_dir, file)
+                
+                # If no specific audio file found, return any file that was downloaded
+                files = [f for f in os.listdir(temp_dir) if not f.startswith('.')]
+                if files:
+                    return os.path.join(temp_dir, files[0])
+                
+                return None
                 
         except Exception as e:
             st.error(f"Error downloading YouTube video: {str(e)}")
+            st.error("Try using a different YouTube URL or upload a video file instead.")
             return None
     
     def extract_audio_from_video(self, video_path: str) -> str:
@@ -360,6 +386,7 @@ def main():
         st.markdown("- Longer videos may take several minutes")
         st.markdown("- YouTube URLs work best with public videos")
         st.markdown("- Supported formats: MP4, AVI, MOV, MKV")
+        st.markdown("- First run downloads AI models (be patient!)")
     
     # Main interface
     tab1, tab2 = st.tabs(["📥 Process Video", "📊 Results"])
@@ -380,6 +407,7 @@ def main():
                 "Enter YouTube URL:",
                 placeholder="https://www.youtube.com/watch?v=..."
             )
+            st.info("💡 Try these test videos if you need examples:\n- https://www.youtube.com/watch?v=jNQXAC9IVRw\n- https://www.youtube.com/watch?v=dQw4w9WgXcQ")
         else:
             video_file = st.file_uploader(
                 "Upload video file:",
@@ -421,7 +449,7 @@ def main():
                     }
                 
                 if not audio_file:
-                    st.error("Failed to process audio")
+                    st.error("Failed to process audio. Try a different video or check the URL.")
                     return
                 
                 # Step 2: Transcribe audio
@@ -463,6 +491,7 @@ def main():
                 
             except Exception as e:
                 st.error(f"An error occurred: {str(e)}")
+                st.error("Try using a different video or check your internet connection.")
     
     with tab2:
         if 'results' not in st.session_state:
