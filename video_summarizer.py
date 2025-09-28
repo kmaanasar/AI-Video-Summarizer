@@ -7,6 +7,7 @@ import re
 from typing import List, Dict, Optional
 import requests
 from pathlib import Path
+import shutil # <-- ADDED FOR ROBUST CLEANUP
 
 # Core libraries
 import whisper
@@ -69,13 +70,30 @@ class VideoSummarizer:
                 
                 # Download audio stream
                 audio_stream = yt.streams.filter(only_audio=True).first()
+                if not audio_stream:
+                    st.error("No suitable audio stream found.")
+                    return None
                 
-                # Create temp file
+                # Create temp dir
                 temp_dir = tempfile.mkdtemp()
-                audio_file = os.path.join(temp_dir, "audio.mp4")
                 
-                audio_stream.download(filename=audio_file)
-                return audio_file
+                # --- FIX 1 START: Use output_path and filename base, letting pytubefix choose the extension ---
+                filename_base = "audio_temp"
+                
+                # Download the stream to the temp directory.
+                audio_stream.download(output_path=temp_dir, filename=filename_base)
+                
+                # Find the actual downloaded file using Path().glob(), which is robust
+                # (e.g., finds 'audio_temp.mp4', 'audio_temp.webm', etc., and not the incorrect path).
+                downloaded_files = list(Path(temp_dir).glob(f"{filename_base}.*"))
+                
+                if not downloaded_files:
+                    raise FileNotFoundError("Pytubefix failed to download the audio stream.")
+                    
+                # Return the absolute path to the actual file
+                audio_file_path = str(downloaded_files[0])
+                return audio_file_path
+                # --- FIX 1 END ---
                 
         except Exception as e:
             st.error(f"Error downloading YouTube video: {str(e)}")
@@ -397,24 +415,44 @@ def main():
             
             summarizer = st.session_state.summarizer
             
+            # --- FIX 2 START: Centralized temporary directory tracking ---
+            temp_dirs_to_clean = []
+            
             try:
                 # Step 1: Get audio file
                 audio_file = None
                 
                 if youtube_url:
+                    # The download function now creates a temp dir. The file path contains the dir.
                     audio_file = summarizer.download_youtube_audio(youtube_url)
+                    
+                    if audio_file:
+                        # Track the temp directory created by the download function
+                        temp_dirs_to_clean.append(os.path.dirname(audio_file)) 
+                        
                     video_info = {
                         'source': 'YouTube',
                         'url': youtube_url
                     }
                 else:
+                    # Handle Uploaded Video File
+                    
+                    # Create a temp dir for the uploaded video file
+                    temp_dir_video = tempfile.mkdtemp() 
+                    temp_dirs_to_clean.append(temp_dir_video) # Track video dir
+                    
                     # Save uploaded file temporarily
-                    temp_dir = tempfile.mkdtemp()
-                    video_path = os.path.join(temp_dir, video_file.name)
+                    video_path = os.path.join(temp_dir_video, video_file.name)
                     with open(video_path, 'wb') as f:
                         f.write(video_file.read())
                     
+                    # The extract function also creates a temp dir for the .wav file
                     audio_file = summarizer.extract_audio_from_video(video_path)
+                    
+                    if audio_file:
+                        # Track the temp directory created by the extract function
+                        temp_dirs_to_clean.append(os.path.dirname(audio_file))
+
                     video_info = {
                         'source': 'Upload',
                         'filename': video_file.name
@@ -454,15 +492,20 @@ def main():
                 
                 st.success("✅ Processing complete! Check the Results tab.")
                 
-                # Clean up temp files
-                try:
-                    if audio_file and os.path.exists(audio_file):
-                        os.remove(audio_file)
-                except:
-                    pass
-                
             except Exception as e:
                 st.error(f"An error occurred: {str(e)}")
+            
+            finally:
+                # --- FIX 3: Robustly clean up all temporary directories regardless of success/failure ---
+                for temp_dir in set(temp_dirs_to_clean): # Use set to handle potential duplicate paths
+                    try:
+                        if os.path.exists(temp_dir):
+                            # Recursively delete the entire directory and all its contents
+                            shutil.rmtree(temp_dir) 
+                    except Exception as clean_e:
+                        # Log cleanup error but don't stop the app
+                        st.warning(f"Failed to clean up temporary directory {temp_dir}: {clean_e}")
+                # --- FIX 3 END ---
     
     with tab2:
         if 'results' not in st.session_state:
