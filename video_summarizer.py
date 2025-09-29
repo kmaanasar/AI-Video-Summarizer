@@ -384,6 +384,7 @@ def main():
     )
     
     st.title("🎥 AI Video Summarizer")
+    st.info("ℹ️ **Note:** YouTube downloads don't work on the cloud version. Please upload your video files directly for best results.")
     st.markdown("**Powered by Local AI Models**")
     
     # Initialize session state
