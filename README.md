@@ -82,6 +82,7 @@ reportlab
 ```
 ├── app.py                 # Main Streamlit app
 ├── requirements.txt       # Dependencies
+├── packages.txt           # Streamlit Dependencies
 ├── README.md              # Documentation
 ```
 
