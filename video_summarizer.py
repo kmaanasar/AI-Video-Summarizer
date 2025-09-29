@@ -1,12 +1,9 @@
 import streamlit as st
 import os
 import tempfile
-import json
 from datetime import datetime, timedelta
 import re
-from typing import List, Dict, Optional
-import requests
-from pathlib import Path
+from typing import List, Dict
 import time
 
 # Core libraries
@@ -14,9 +11,9 @@ import moviepy.editor as mp
 import yt_dlp
 import torch
 
-# Hugging Face
-from transformers import pipeline, AutoTokenizer, AutoModelForSeq2SeqLM
-from huggingface_hub import InferenceClient
+# Local AI models
+import whisper
+from transformers import pipeline
 
 # PDF generation
 from reportlab.lib.pagesizes import letter
@@ -24,41 +21,68 @@ from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import inch
 
-class HuggingFaceVideoSummarizer:
-    def __init__(self, hf_token: str):
-        self.hf_token = hf_token
-        self.inference_client = InferenceClient(token=hf_token)
-        
-        # Use the best models by default
-        self.transcription_model = "openai/whisper-large-v3"
-        self.summarization_model = "facebook/bart-large-cnn"
-        
-        # Load local summarization pipeline as backup
+class LocalVideoSummarizer:
+    def __init__(self):
+        self.whisper_model = None
+        self.summarizer = None
+    
+    def setup_models(self, whisper_size: str = "base"):
+        """Setup local models"""
         try:
-            st.info("Loading backup summarization model...")
-            self.local_summarizer = pipeline(
-                "summarization",
-                model="facebook/bart-base",
-                device=0 if torch.cuda.is_available() else -1
-            )
-            st.success("Backup model ready!")
+            # Load Whisper model
+            st.info(f"Loading Whisper {whisper_size} model...")
+            self.whisper_model = whisper.load_model(whisper_size)
+            st.success(f"✅ Whisper {whisper_size} loaded!")
+            
+            # Load summarization model
+            st.info("Loading summarization model...")
+            device = 0 if torch.cuda.is_available() else -1
+            
+            # Try models in order of preference
+            models_to_try = [
+                ("facebook/bart-large-cnn", "BART Large CNN"),
+                ("facebook/bart-base", "BART Base"),
+                ("t5-small", "T5 Small")
+            ]
+            
+            for model_name, display_name in models_to_try:
+                try:
+                    self.summarizer = pipeline(
+                        "summarization",
+                        model=model_name,
+                        device=device,
+                        torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32
+                    )
+                    st.success(f"✅ {display_name} loaded!")
+                    break
+                except Exception as e:
+                    st.warning(f"Couldn't load {display_name}, trying next...")
+                    continue
+            
+            if not self.summarizer:
+                st.error("Failed to load any summarization model")
+                return False
+            
+            return True
+            
         except Exception as e:
-            st.warning(f"Backup model failed to load: {e}")
-            self.local_summarizer = None
+            st.error(f"Model setup failed: {str(e)}")
+            st.error("Install required packages: pip install torch transformers openai-whisper")
+            return False
     
     def download_youtube_audio(self, url: str) -> str:
-        """Download audio from YouTube video using yt-dlp"""
+        """Download audio from YouTube"""
         try:
-            with st.spinner("Downloading YouTube video..."):
+            with st.spinner("Downloading YouTube audio..."):
                 temp_dir = tempfile.mkdtemp()
-                audio_file = os.path.join(temp_dir, "audio")
                 
                 ydl_opts = {
-                    'format': 'bestaudio/best',
-                    'outtmpl': audio_file + '.%(ext)s',
+                    'format': 'bestaudio[ext=m4a]/bestaudio/best',
+                    'outtmpl': os.path.join(temp_dir, 'audio.%(ext)s'),
                     'postprocessors': [{
                         'key': 'FFmpegExtractAudio',
                         'preferredcodec': 'wav',
+                        'preferredquality': '192',
                     }],
                     'quiet': True,
                     'no_warnings': True,
@@ -67,114 +91,130 @@ class HuggingFaceVideoSummarizer:
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                     try:
                         info = ydl.extract_info(url, download=False)
+                        duration = info.get('duration', 0)
+                        
+                        if duration > 3600:
+                            st.warning("⚠️ Video is over 1 hour. Processing will take a long time.")
+                        
                         st.write(f"**Title:** {info.get('title', 'Unknown')}")
-                        st.write(f"**Duration:** {str(timedelta(seconds=info.get('duration', 0)))}")
-                        st.write(f"**Uploader:** {info.get('uploader', 'Unknown')}")
+                        st.write(f"**Duration:** {str(timedelta(seconds=duration))}")
+                        st.write(f"**Channel:** {info.get('uploader', 'Unknown')}")
                     except:
-                        st.write("**Processing video...**")
+                        st.info("Downloading video...")
                     
                     ydl.download([url])
                 
-                # Find downloaded file
+                # Find downloaded audio file
                 for file in os.listdir(temp_dir):
-                    if file.startswith("audio"):
-                        return os.path.join(temp_dir, file)
+                    if file.endswith('.wav'):
+                        audio_path = os.path.join(temp_dir, file)
+                        file_size = os.path.getsize(audio_path) / (1024 * 1024)
+                        st.success(f"Downloaded: {file_size:.1f}MB")
+                        return audio_path
+                
+                # Look for any audio file
+                audio_files = [f for f in os.listdir(temp_dir) 
+                              if f.endswith(('.mp3', '.m4a', '.wav', '.flac'))]
+                if audio_files:
+                    return os.path.join(temp_dir, audio_files[0])
                 
                 return None
                 
         except Exception as e:
-            st.error(f"Download error: {str(e)}")
+            st.error(f"YouTube download failed: {str(e)}")
             return None
     
     def extract_audio_from_video(self, video_path: str) -> str:
-        """Extract audio from uploaded video file"""
+        """Extract audio from video file"""
         try:
             with st.spinner("Extracting audio from video..."):
                 video = mp.VideoFileClip(video_path)
+                
                 temp_dir = tempfile.mkdtemp()
                 audio_file = os.path.join(temp_dir, "extracted_audio.wav")
-                video.audio.write_audiofile(audio_file, verbose=False, logger=None)
+                
+                video.audio.write_audiofile(
+                    audio_file,
+                    verbose=False,
+                    logger=None,
+                    codec='pcm_s16le'
+                )
                 video.close()
+                
+                file_size = os.path.getsize(audio_file) / (1024 * 1024)
+                st.success(f"Extracted: {file_size:.1f}MB")
+                
                 return audio_file
+                
         except Exception as e:
-            st.error(f"Audio extraction error: {str(e)}")
+            st.error(f"Audio extraction failed: {str(e)}")
             return None
     
-    def transcribe_audio(self, audio_file: str) -> Dict:
-        """Transcribe audio using Hugging Face Whisper"""
+    def transcribe_audio(self, audio_file: str, language: str = None) -> Dict:
+        """Transcribe audio using local Whisper"""
         try:
-            # Check file size
-            file_size_mb = os.path.getsize(audio_file) / (1024 * 1024)
-            st.info(f"Audio file size: {file_size_mb:.1f}MB")
+            if not self.whisper_model:
+                st.error("Whisper model not loaded!")
+                return None
             
-            if file_size_mb > 25:
-                st.warning("Large file detected. This may take longer or fail.")
-                st.info("Consider using a shorter video clip.")
+            file_size = os.path.getsize(audio_file) / (1024 * 1024)
+            if file_size > 100:
+                st.warning(f"Large audio file ({file_size:.1f}MB). This will take several minutes.")
             
-            with st.spinner("Transcribing with Hugging Face Whisper..."):
-                # Read audio file
-                with open(audio_file, 'rb') as f:
-                    audio_data = f.read()
-                
-                # Transcribe with retry logic
-                max_retries = 3
-                for attempt in range(max_retries):
-                    try:
-                        result = self.inference_client.automatic_speech_recognition(
-                            audio_data,
-                            model=self.transcription_model
-                        )
-                        
-                        if isinstance(result, dict) and 'text' in result:
-                            text = result['text']
-                        elif isinstance(result, str):
-                            text = result
-                        else:
-                            raise Exception(f"Unexpected result format: {type(result)}")
-                        
-                        # Create simple segments (HF API doesn't provide detailed timestamps)
-                        words = text.split()
-                        segments = []
-                        
-                        # Estimate timestamps (very rough approximation)
-                        words_per_second = 2.5  # Average speaking rate
-                        current_time = 0
-                        
-                        for i in range(0, len(words), 10):  # 10 words per segment
-                            segment_words = words[i:i+10]
-                            segment_text = " ".join(segment_words)
-                            segment_duration = len(segment_words) / words_per_second
-                            
-                            segments.append({
-                                'start': current_time,
-                                'end': current_time + segment_duration,
-                                'text': segment_text
-                            })
-                            
-                            current_time += segment_duration
-                        
-                        return {
-                            'text': text,
-                            'language': 'unknown',  # HF API doesn't return language
-                            'segments': segments
-                        }
-                        
-                    except Exception as e:
-                        if attempt < max_retries - 1:
-                            wait_time = 2 ** attempt
-                            st.warning(f"Attempt {attempt + 1} failed, retrying in {wait_time}s...")
-                            time.sleep(wait_time)
-                        else:
-                            raise e
-                
+            with st.spinner("Transcribing audio with Whisper... Please wait."):
+                result = self.whisper_model.transcribe(
+                    audio_file,
+                    language=language if language != 'auto' else None,
+                    task="transcribe",
+                    verbose=False,
+                    fp16=torch.cuda.is_available()
+                )
+            
+            if not result or not result.get('text'):
+                st.error("Transcription produced no text")
+                return None
+            
+            detected_lang = result.get('language', 'unknown')
+            st.success(f"✅ Transcription complete! Language: {detected_lang}")
+            st.info(f"Transcribed {len(result['text'].split())} words")
+            
+            return result
+            
         except Exception as e:
             st.error(f"Transcription failed: {str(e)}")
-            st.error("Try using a smaller audio file or check your internet connection.")
+            
+            if "CUDA" in str(e) or "GPU" in str(e):
+                st.info("💡 GPU error detected. Try restarting the app.")
+            elif "memory" in str(e).lower():
+                st.info("💡 Memory error. Try using 'tiny' or 'base' Whisper model.")
+            
             return None
     
     def chunk_transcript(self, transcript: Dict, chunk_size: int = 500) -> List[Dict]:
         """Split transcript into chunks"""
         segments = transcript.get('segments', [])
+        
+        if not segments:
+            text = transcript.get('text', '')
+            words = text.split()
+            chunks = []
+            
+            for i in range(0, len(words), chunk_size):
+                chunk_words = words[i:i + chunk_size]
+                chunk_text = ' '.join(chunk_words)
+                start_time = i * 0.5
+                end_time = (i + len(chunk_words)) * 0.5
+                
+                chunks.append({
+                    'text': chunk_text,
+                    'start_time': start_time,
+                    'end_time': end_time,
+                    'timestamp': self.format_timestamp(start_time),
+                    'word_count': len(chunk_words)
+                })
+            
+            return chunks
+        
         chunks = []
         current_chunk = ""
         current_start = 0
@@ -182,55 +222,79 @@ class HuggingFaceVideoSummarizer:
         word_count = 0
         
         for segment in segments:
-            segment_text = segment['text'].strip()
+            segment_text = segment.get('text', '').strip()
+            if not segment_text:
+                continue
+                
             segment_words = len(segment_text.split())
             
             if word_count == 0:
-                current_start = segment['start']
+                current_start = segment.get('start', 0)
             
             if word_count + segment_words > chunk_size and current_chunk:
                 chunks.append({
                     'text': current_chunk.strip(),
                     'start_time': current_start,
                     'end_time': current_end,
-                    'timestamp': self.format_timestamp(current_start)
+                    'timestamp': self.format_timestamp(current_start),
+                    'word_count': word_count
                 })
                 
                 current_chunk = segment_text
-                current_start = segment['start']
+                current_start = segment.get('start', current_end)
                 word_count = segment_words
             else:
-                current_chunk += " " + segment_text
+                if current_chunk:
+                    current_chunk += " " + segment_text
+                else:
+                    current_chunk = segment_text
                 word_count += segment_words
             
-            current_end = segment['end']
+            current_end = segment.get('end', current_start + 10)
         
         if current_chunk:
             chunks.append({
                 'text': current_chunk.strip(),
                 'start_time': current_start,
                 'end_time': current_end,
-                'timestamp': self.format_timestamp(current_start)
+                'timestamp': self.format_timestamp(current_start),
+                'word_count': word_count
             })
         
         return chunks
     
     def format_timestamp(self, seconds: float) -> str:
-        """Convert seconds to MM:SS format"""
-        minutes = int(seconds // 60)
-        seconds = int(seconds % 60)
-        return f"{minutes:02d}:{seconds:02d}"
+        """Format seconds as timestamp"""
+        total_seconds = int(seconds)
+        hours = total_seconds // 3600
+        minutes = (total_seconds % 3600) // 60
+        secs = total_seconds % 60
+        
+        if hours > 0:
+            return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+        else:
+            return f"{minutes:02d}:{secs:02d}"
     
     def summarize_text(self, text: str, style: str = "bullet_points") -> str:
-        """Summarize text using Hugging Face BART"""
+        """Summarize text using local model"""
         try:
-            # Adjust parameters based on style
+            if not self.summarizer:
+                return "Summarization model not available"
+            
+            # Truncate if too long
+            words = text.split()
+            max_words = 800
+            
+            if len(words) > max_words:
+                text = ' '.join(words[:max_words])
+            
+            # Set parameters based on style
             if style == "bullet_points":
                 max_length = 200
                 min_length = 50
             elif style == "paragraph":
                 max_length = 150
-                min_length = 30
+                min_length = 40
             elif style == "detailed":
                 max_length = 300
                 min_length = 100
@@ -238,151 +302,129 @@ class HuggingFaceVideoSummarizer:
                 max_length = 150
                 min_length = 50
             
-            # Try HF API first
-            try:
-                result = self.inference_client.summarization(
-                    text,
-                    model=self.summarization_model,
-                    parameters={
-                        "max_length": max_length,
-                        "min_length": min_length,
-                        "do_sample": False
-                    }
-                )
-                
-                if isinstance(result, list) and len(result) > 0:
-                    return result[0].get('summary_text', 'Summary not available')
-                elif isinstance(result, dict):
-                    return result.get('summary_text', 'Summary not available')
-                else:
-                    raise Exception("Unexpected API response format")
-                    
-            except Exception as api_error:
-                st.warning(f"HF API failed: {api_error}")
-                
-                # Fallback to local model
-                if self.local_summarizer:
-                    st.info("Using backup local model...")
-                    
-                    # Truncate text for local model
-                    words = text.split()
-                    if len(words) > 500:
-                        text = " ".join(words[:500])
-                    
-                    result = self.local_summarizer(
-                        text,
-                        max_length=max_length,
-                        min_length=min_length,
-                        do_sample=False
-                    )
-                    
-                    return result[0]['summary_text']
-                else:
-                    return f"Summary unavailable: {api_error}"
-                    
-        except Exception as e:
-            st.error(f"Summarization error: {str(e)}")
-            return text[:200] + "..."
-    
-    def summarize_chunks(self, chunks: List[Dict], style: str) -> List[Dict]:
-        """Summarize each chunk"""
-        summarized_chunks = []
-        progress_bar = st.progress(0)
-        
-        for i, chunk in enumerate(chunks):
-            with st.spinner(f"Summarizing chunk {i+1}/{len(chunks)}..."):
-                summary = self.summarize_text(chunk['text'], style)
-                
-                summarized_chunks.append({
-                    **chunk,
-                    'summary': summary
-                })
+            result = self.summarizer(
+                text,
+                max_length=max_length,
+                min_length=min_length,
+                do_sample=False,
+                early_stopping=True
+            )
             
-            progress_bar.progress((i + 1) / len(chunks))
-        
-        return summarized_chunks
+            if result and len(result) > 0:
+                summary = result[0].get('summary_text', '')
+                
+                # Format as bullet points if requested
+                if style == "bullet_points" and summary:
+                    sentences = re.split(r'[.!?]+', summary)
+                    bullets = []
+                    for sentence in sentences:
+                        sentence = sentence.strip()
+                        if sentence and len(sentence) > 10:
+                            bullets.append(f"• {sentence}")
+                    if bullets:
+                        summary = '\n'.join(bullets)
+                
+                return summary if summary else "Summary could not be generated"
+            
+            return "No summary generated"
+            
+        except Exception as e:
+            st.warning(f"Summarization error: {str(e)}")
+            sentences = re.split(r'[.!?]+', text)
+            return '. '.join(sentences[:3]) + "..."
     
-    def generate_final_summary(self, summarized_chunks: List[Dict], style: str) -> str:
-        """Generate final summary from all chunk summaries"""
-        all_summaries = " ".join([chunk['summary'] for chunk in summarized_chunks])
-        return self.summarize_text(all_summaries, style)
-    
-    def export_to_pdf(self, content: Dict, filename: str):
-        """Export summary to PDF"""
+    def export_to_pdf(self, results: Dict, video_info: Dict, filename: str) -> bool:
+        """Export results to PDF"""
         try:
             doc = SimpleDocTemplate(filename, pagesize=letter)
             styles = getSampleStyleSheet()
             story = []
             
             title_style = ParagraphStyle(
-                'CustomTitle',
-                parent=styles['Heading1'],
-                fontSize=16,
-                spaceAfter=30,
+                'Title',
+                parent=styles['Title'],
+                fontSize=18,
+                spaceAfter=30
             )
             story.append(Paragraph("Video Summary Report", title_style))
-            story.append(Spacer(1, 12))
+            story.append(Spacer(1, 20))
             
-            story.append(Paragraph(f"**Generated:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", styles['Normal']))
-            story.append(Paragraph(f"**Style:** {content.get('style', 'N/A')}", styles['Normal']))
-            story.append(Spacer(1, 12))
+            story.append(Paragraph(f"<b>Generated:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", styles['Normal']))
+            story.append(Paragraph(f"<b>Processing Time:</b> {results['processing_time']:.1f} seconds", styles['Normal']))
             
-            if 'video_info' in content:
-                story.append(Paragraph(f"**Source:** {content['video_info'].get('source', 'N/A')}", styles['Normal']))
-                story.append(Spacer(1, 12))
+            if video_info.get('source') == 'YouTube':
+                story.append(Paragraph(f"<b>Source:</b> YouTube", styles['Normal']))
+            else:
+                story.append(Paragraph(f"<b>Source:</b> Uploaded file", styles['Normal']))
             
-            story.append(Paragraph("Overall Summary", styles['Heading2']))
-            story.append(Paragraph(content.get('final_summary', ''), styles['Normal']))
-            story.append(Spacer(1, 12))
+            story.append(Spacer(1, 20))
             
-            story.append(Paragraph("Timestamped Analysis", styles['Heading2']))
-            for chunk in content.get('chunks', []):
-                story.append(Paragraph(f"**{chunk['timestamp']}**", styles['Heading3']))
+            story.append(Paragraph("Executive Summary", styles['Heading2']))
+            story.append(Paragraph(results['final_summary'], styles['Normal']))
+            story.append(Spacer(1, 20))
+            
+            story.append(Paragraph("Detailed Analysis", styles['Heading2']))
+            for chunk in results['chunks']:
+                story.append(Paragraph(f"<b>{chunk['timestamp']}</b>", styles['Heading3']))
                 story.append(Paragraph(chunk['summary'], styles['Normal']))
-                story.append(Spacer(1, 8))
+                story.append(Spacer(1, 10))
             
             doc.build(story)
             return True
+            
         except Exception as e:
-            st.error(f"PDF creation error: {str(e)}")
+            st.error(f"PDF export failed: {str(e)}")
             return False
 
 def main():
     st.set_page_config(
-        page_title="Simple HF Video Summarizer",
+        page_title="Local Video Summarizer",
         page_icon="🎥",
         layout="wide"
     )
     
-    st.title("🎥 Simple Video Summarizer")
-    st.markdown("**Powered by Hugging Face AI Models**")
+    st.title("🎥 Local Video Summarizer")
+    st.markdown("**Powered by Local AI Models - No API Keys Required**")
     
     # Initialize session state
     if 'summarizer' not in st.session_state:
         st.session_state.summarizer = None
+        st.session_state.models_loaded = False
+    if 'results' not in st.session_state:
+        st.session_state.results = None
     
-    # Sidebar - Just the essentials
+    # Sidebar
     with st.sidebar:
-        st.header("⚙️ Setup")
+        st.header("⚙️ Settings")
         
-        # HF Token
-        hf_token = st.text_input(
-            "Hugging Face Token",
-            type="password",
-            help="Get your free token at https://huggingface.co/settings/tokens"
+        # Model selection
+        whisper_size = st.selectbox(
+            "Whisper Model",
+            ["tiny", "base", "small", "medium", "large"],
+            index=1,
+            help="tiny=fastest, large=most accurate"
         )
         
-        if hf_token:
-            st.success("✅ Token provided!")
-        else:
-            st.error("❌ Hugging Face token required")
-            st.info("This app uses only HF models for best quality")
+        # Language
+        target_language = st.selectbox(
+            "Language",
+            ["auto", "en", "es", "fr", "de", "it", "pt", "ru", "ja", "ko", "zh"],
+            format_func=lambda x: {
+                "auto": "🌐 Auto-detect",
+                "en": "🇺🇸 English",
+                "es": "🇪🇸 Spanish",
+                "fr": "🇫🇷 French",
+                "de": "🇩🇪 German",
+                "it": "🇮🇹 Italian",
+                "pt": "🇵🇹 Portuguese",
+                "ru": "🇷🇺 Russian",
+                "ja": "🇯🇵 Japanese",
+                "ko": "🇰🇷 Korean",
+                "zh": "🇨🇳 Chinese"
+            }[x]
+        )
         
-        st.markdown("---")
-        
-        # Simple options
-        st.subheader("📝 Options")
-        
+        # Summary options
         summary_style = st.selectbox(
             "Summary Style",
             ["bullet_points", "paragraph", "detailed"],
@@ -393,50 +435,47 @@ def main():
             }[x]
         )
         
-        chunk_size = st.slider("Text chunk size", 300, 800, 500, help="Smaller = more detailed")
+        chunk_size = st.slider("Words per chunk", 300, 800, 500)
         
         st.markdown("---")
         
-        # Models being used
-        st.subheader("🤖 Models Used")
-        st.info("🎙️ **Transcription:** Whisper Large v3")
-        st.info("📝 **Summarization:** BART Large CNN")
-        st.caption("These are the best open-source models available")
-        
+        # System info
+        st.subheader("💻 System")
         if torch.cuda.is_available():
-            st.success("🚀 GPU acceleration enabled")
+            st.success("🚀 GPU Available")
         else:
-            st.warning("💻 Using CPU (slower)")
+            st.warning("💻 CPU Mode")
+        
+        if st.session_state.models_loaded:
+            st.success("✅ Models Ready")
+        else:
+            st.info("⏳ Models not loaded")
     
     # Main interface
-    if not hf_token:
-        st.warning("👈 Please add your Hugging Face token in the sidebar to get started")
-        st.info("**Why do you need a token?**")
-        st.markdown("""
-        - Access to the latest AI models
-        - Free with rate limits (generous for personal use)  
-        - No local model downloads needed
-        - Always up-to-date models
-        """)
-        st.markdown("**Get your token:** https://huggingface.co/settings/tokens")
-        st.markdown("**Select permissions:** Just choose 'Read' access")
-        return
-    
-    # Initialize summarizer
-    if st.session_state.summarizer is None:
-        with st.spinner("Initializing AI models..."):
-            st.session_state.summarizer = HuggingFaceVideoSummarizer(hf_token)
-    
-    summarizer = st.session_state.summarizer
-    
     tab1, tab2 = st.tabs(["📥 Process Video", "📊 Results"])
     
     with tab1:
-        st.header("Input Video")
+        st.header("Video Input")
         
+        # Model loading
+        if not st.session_state.models_loaded:
+            st.info("👇 First, load the AI models (this downloads models on first run)")
+            
+            if st.button("🔄 Load AI Models", type="primary"):
+                summarizer = LocalVideoSummarizer()
+                if summarizer.setup_models(whisper_size):
+                    st.session_state.summarizer = summarizer
+                    st.session_state.models_loaded = True
+                    st.rerun()
+            
+            st.stop()
+        
+        summarizer = st.session_state.summarizer
+        
+        # Input selection
         input_method = st.radio(
-            "Choose input:",
-            ["YouTube URL", "Upload Video File"],
+            "Input Method:",
+            ["YouTube URL", "Upload Video"],
             horizontal=True
         )
         
@@ -450,25 +489,32 @@ def main():
             )
         else:
             video_file = st.file_uploader(
-                "Upload video:",
-                type=['mp4', 'avi', 'mov', 'mkv', 'webm']
+                "Video file:",
+                type=['mp4', 'avi', 'mov', 'mkv', 'webm', 'm4v']
             )
         
-        if st.button("🚀 Start Processing", type="primary"):
+        # Process button
+        if st.button("🚀 Start Processing", type="primary", disabled=not (youtube_url or video_file)):
             if not youtube_url and not video_file:
                 st.error("Please provide a video")
                 return
             
+            start_time = time.time()
+            
             try:
-                # Step 1: Get audio
+                # Get audio
                 audio_file = None
+                video_info = {}
                 
                 if youtube_url:
+                    st.header("📺 Downloading")
                     audio_file = summarizer.download_youtube_audio(youtube_url)
                     video_info = {'source': 'YouTube', 'url': youtube_url}
                 else:
+                    st.header("📁 Processing File")
                     temp_dir = tempfile.mkdtemp()
                     video_path = os.path.join(temp_dir, video_file.name)
+                    
                     with open(video_path, 'wb') as f:
                         f.write(video_file.read())
                     
@@ -476,40 +522,71 @@ def main():
                     video_info = {'source': 'Upload', 'filename': video_file.name}
                 
                 if not audio_file:
-                    st.error("Failed to process audio")
+                    st.error("Failed to get audio")
                     return
                 
-                # Step 2: Transcribe
-                st.header("🎙️ Transcribing...")
-                transcript = summarizer.transcribe_audio(audio_file)
+                # Transcribe
+                st.header("🎙️ Transcribing")
+                transcript = summarizer.transcribe_audio(
+                    audio_file,
+                    target_language if target_language != 'auto' else None
+                )
+                
                 if not transcript:
                     st.error("Transcription failed")
                     return
                 
-                st.success("Transcription complete!")
-                
-                # Step 3: Chunk and summarize
-                st.header("📝 Summarizing...")
+                # Chunk
+                st.header("📝 Processing Text")
                 chunks = summarizer.chunk_transcript(transcript, chunk_size)
-                st.info(f"Split into {len(chunks)} chunks")
+                st.success(f"Split into {len(chunks)} chunks")
                 
-                summarized_chunks = summarizer.summarize_chunks(chunks, summary_style)
-                final_summary = summarizer.generate_final_summary(summarized_chunks, summary_style)
+                # Summarize
+                st.header("🔄 Generating Summaries")
+                progress_bar = st.progress(0)
+                
+                summarized_chunks = []
+                for i, chunk in enumerate(chunks):
+                    summary = summarizer.summarize_text(chunk['text'], summary_style)
+                    
+                    chunk_result = {
+                        **chunk,
+                        'summary': summary
+                    }
+                    summarized_chunks.append(chunk_result)
+                    
+                    progress_bar.progress((i + 1) / len(chunks))
+                
+                # Final summary
+                st.header("🎯 Final Summary")
+                all_summaries = ' '.join([c['summary'] for c in summarized_chunks])
+                final_summary = summarizer.summarize_text(all_summaries, summary_style)
+                
+                processing_time = time.time() - start_time
                 
                 # Store results
                 st.session_state.results = {
+                    'processing_results': {
+                        'success': True,
+                        'transcript': transcript,
+                        'chunks': summarized_chunks,
+                        'final_summary': final_summary,
+                        'processing_time': processing_time
+                    },
                     'video_info': video_info,
-                    'transcript': transcript,
-                    'chunks': summarized_chunks,
-                    'final_summary': final_summary,
-                    'style': summary_style
+                    'settings': {
+                        'style': summary_style,
+                        'chunk_size': chunk_size,
+                        'whisper_model': whisper_size
+                    }
                 }
                 
-                st.success("✅ Complete! Check the Results tab.")
+                st.success(f"✅ Complete in {processing_time:.1f} seconds!")
                 
-                # Quick preview
-                st.subheader("🎯 Quick Preview")
-                st.write(final_summary)
+                # Preview
+                with st.expander("👀 Preview", expanded=True):
+                    st.write("**Final Summary:**")
+                    st.write(final_summary)
                 
                 # Cleanup
                 try:
@@ -519,71 +596,73 @@ def main():
                     pass
                     
             except Exception as e:
-                st.error(f"Processing failed: {str(e)}")
-                st.info("Try a different video or check your internet connection")
+                st.error(f"Error: {str(e)}")
     
     with tab2:
-        if 'results' not in st.session_state:
+        if not st.session_state.results:
             st.info("👈 Process a video first")
             return
         
-        results = st.session_state.results
+        data = st.session_state.results
+        results = data['processing_results']
+        video_info = data['video_info']
         
         st.header("📋 Results")
         
-        # Info and export
-        col1, col2 = st.columns([2, 1])
+        # Metrics
+        col1, col2, col3 = st.columns(3)
         
         with col1:
-            if results['video_info']['source'] == 'YouTube':
-                st.write(f"**Source:** {results['video_info']['url']}")
-            else:
-                st.write(f"**File:** {results['video_info']['filename']}")
-            st.write(f"**Style:** {results['style']}")
+            st.metric("Processing Time", f"{results['processing_time']:.1f}s")
         
         with col2:
-            if st.button("📄 Export PDF"):
-                pdf_filename = f"summary_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
-                if summarizer.export_to_pdf(results, pdf_filename):
-                    with open(pdf_filename, 'rb') as f:
-                        st.download_button(
-                            "⬇️ Download PDF",
-                            f.read(),
-                            pdf_filename,
-                            "application/pdf"
-                        )
+            st.metric("Chunks", len(results['chunks']))
         
-        # Final summary
-        st.subheader("🎯 Overall Summary")
+        with col3:
+            total_words = sum(c['word_count'] for c in results['chunks'])
+            st.metric("Words", f"{total_words:,}")
+        
+        # Export
+        if st.button("📄 Generate PDF"):
+            pdf_filename = f"summary_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
+            
+            if st.session_state.summarizer.export_to_pdf(results, video_info, pdf_filename):
+                with open(pdf_filename, 'rb') as f:
+                    st.download_button(
+                        "⬇️ Download PDF",
+                        f.read(),
+                        pdf_filename,
+                        "application/pdf"
+                    )
+        
+        # Summary
+        st.subheader("🎯 Executive Summary")
         st.write(results['final_summary'])
         
-        # Timestamped summaries
+        # Timestamped
         st.subheader("⏰ Timestamped Analysis")
         
         for i, chunk in enumerate(results['chunks']):
-            with st.expander(f"🕐 {chunk['timestamp']} - Part {i+1}"):
+            with st.expander(f"🕐 {chunk['timestamp']} - Part {i+1} ({chunk['word_count']} words)"):
                 st.write("**Summary:**")
                 st.write(chunk['summary'])
                 
-                st.write("**Original:**")
-                st.text_area(
-                    f"Transcript part {i+1}",
-                    chunk['text'],
-                    height=100,
-                    key=f"transcript_{i}"
-                )
+                with st.expander("📝 Full Text"):
+                    st.text_area(
+                        "Transcript",
+                        chunk['text'],
+                        height=150,
+                        key=f"transcript_{i}"
+                    )
         
-        # Full transcript
-        with st.expander("📝 Full Transcript"):
-            full_text = results['transcript']['text']
-            st.text_area("Complete transcript", full_text, height=300)
-            
-            st.download_button(
-                "⬇️ Download Transcript",
-                full_text,
-                f"transcript_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
-                "text/plain"
-            )
+        # Download transcript
+        st.subheader("📄 Full Transcript")
+        st.download_button(
+            "⬇️ Download Transcript",
+            results['transcript']['text'],
+            f"transcript_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
+            "text/plain"
+        )
 
 if __name__ == "__main__":
     main()
