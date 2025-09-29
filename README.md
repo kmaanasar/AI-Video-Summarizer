@@ -49,8 +49,8 @@ reportlab
 ## 🚀 Usage
 
 1. **Start the app:**
-   ```bash
-   streamlit run app.py
+   ```cmd
+   streamlit run video_summarizer.py
    ```
 
 2. **Load models** via the sidebar (choose Whisper size + summarizer)

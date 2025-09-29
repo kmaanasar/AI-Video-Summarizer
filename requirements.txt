@@ -3,5 +3,6 @@ torch>=2.0.0
 transformers>=4.30.0
 openai-whisper>=20231117
 moviepy>=1.0.3
+imageio-ffmpeg>=0.4.7
 yt-dlp>=2023.7.6
 reportlab>=4.0.0
