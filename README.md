@@ -66,6 +66,17 @@ reportlab
 
 6. **Export** to PDF or TXT
 
+## 🌐 Deployment Options
+
+**Online Demo:** [https://kmaanasar-ai-video-summarizer-video-summarizer-lgwh3m.streamlit.app/]
+- ✅ File upload works perfectly
+- ⚠️ YouTube downloads may be limited due to cloud restrictions
+
+**Local Installation:** (Recommended for full YouTube support)
+- Follow installation steps above
+- All features work reliably
+
+  
 ## 📂 Project Structure
 
 ```
