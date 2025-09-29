@@ -378,13 +378,13 @@ class LocalVideoSummarizer:
 
 def main():
     st.set_page_config(
-        page_title="Local Video Summarizer",
+        page_title="AI Video Summarizer",
         page_icon="🎥",
         layout="wide"
     )
     
-    st.title("🎥 Local Video Summarizer")
-    st.markdown("**Powered by Local AI Models - No API Keys Required**")
+    st.title("🎥 AI Video Summarizer")
+    st.markdown("**Powered by Local AI Models**")
     
     # Initialize session state
     if 'summarizer' not in st.session_state:
@@ -402,7 +402,7 @@ def main():
             "Whisper Model",
             ["tiny", "base", "small", "medium", "large"],
             index=1,
-            help="tiny=fastest, large=most accurate"
+            help="tiny = fastest, large = most accurate"
         )
         
         # Language
