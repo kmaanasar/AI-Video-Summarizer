@@ -1,6 +1,6 @@
 # 🎥 AI Video Summarizer
 
-An AI-powered Streamlit app that transcribes and summarizes videos using local machine learning models. Supports YouTube links and uploaded video files, with options to export results as PDF or plain text.
+An AI-powered Streamlit app that transcribes and summarizes videos using local machine learning models. Supports YouTube links (only locally) and uploaded video files, with options to export results as PDF or plain text.
 
 ## ✨ Features
 
